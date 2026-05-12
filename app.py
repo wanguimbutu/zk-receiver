@@ -127,7 +127,10 @@ def forward_to_erpnext(user_id, timestamp_str, status):
     # ERPNext expects: "2026-05-12 09:42:15"
     # No transformation usually needed.
 
-    url = f"{ERPNEXT_URL}/api/method/erpnext.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field"
+    # Endpoint path depends on your ERPNext version:
+    #   v13 and earlier: erpnext.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field
+    #   v14 and later:   hrms.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field
+    url = f"{ERPNEXT_URL}/api/method/hrms.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field"
     headers = {
         "Authorization": f"token {ERPNEXT_API_KEY}:{ERPNEXT_API_SECRET}",
         "Content-Type": "application/x-www-form-urlencoded",
