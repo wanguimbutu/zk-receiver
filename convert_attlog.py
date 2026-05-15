@@ -1,112 +1,163 @@
 """
-Convert ZKTeco attlog.dat to ERPNext Employee Checkin CSV.
+Convert ZKTeco SenseFace 4A BKtransaction.dat to ERPNext Employee Checkin CSV.
+
+This script handles the BINARY format used by newer ZKTeco devices
+(SenseFace 4A and similar) where attendance is stored as fixed-size
+binary records, not plain text.
+
+Format reverse-engineered from device serial PYA*, firmware ZAM70-NF43VA:
+  - Header: device serial + firmware version + some metadata
+  - First record starts at offset 0x53
+  - Each record is 28 bytes:
+      bytes [0:4]   = timestamp (LE uint32, seconds since 2000-01-01)
+      bytes [4:16]  = padding/reserved
+      bytes [16:20] = user ID (LE uint32)
+      bytes [20:24] = reserved
+      byte  [24]    = verify type (15=face, 1=fingerprint, 4=password, etc.)
+      byte  [25]    = punch status (0=in, 1=out, 2=break-out, ...)
+      bytes [26:28] = reserved
 
 Usage:
-    python convert_attlog.py attlog.dat output.csv
+    python convert_attlog.py BKtransaction.dat employee_checkins.csv
 
-Or simply:
+Or just:
     python convert_attlog.py
-    (defaults to attlog.dat -> employee_checkins.csv in current folder)
-
-What it does:
-    - Reads tab-separated attendance records from the device export
-    - Maps ZKTeco status codes to ERPNext IN/OUT log types
-    - Outputs a CSV ready for ERPNext's Data Import tool
-
-Notes:
-    - The 'employee' column needs the Employee ID (like HR-EMP-00001), not
-      the Attendance Device ID. After running this script, open the CSV
-      and fill in the 'employee' column based on a lookup of your employees.
-    - Alternatively, if you set 'Attendance Device ID' on each employee
-      in ERPNext, you can use ERPNext's mapping rules during import.
+    (defaults to BKtransaction.dat -> employee_checkins.csv)
 """
 
 import sys
 import csv
 import os
+from datetime import datetime, timedelta
+from collections import Counter
 
-# Map ZKTeco status codes to ERPNext log_type
-# 0=Check-In, 1=Check-Out, 2=Break-Out, 3=Break-In, 4=OT-In, 5=OT-Out
+# ZKTeco timestamp epoch
+ZK_EPOCH = datetime(2000, 1, 1)
+
+# Record structure
+FIRST_RECORD_OFFSET = 0x53
+RECORD_SIZE = 28
+
+# Map punch status -> ERPNext log_type
 LOG_TYPE_MAP = {
-    "0": "IN",
-    "1": "OUT",
-    "2": "OUT",
-    "3": "IN",
-    "4": "IN",
-    "5": "OUT",
+    0: "IN",
+    1: "OUT",
+    2: "OUT",
+    3: "IN",
+    4: "IN",
+    5: "OUT",
+}
+
+VERIFY_NAMES = {
+    1: "PIN/Password",
+    4: "Card",
+    15: "Face",
+    200: "Other",
 }
 
 DEVICE_LABEL = "SenseFace4A"
 
 
-def convert(input_path, output_path):
-    if not os.path.exists(input_path):
-        print(f"ERROR: Input file not found: {input_path}")
-        return False
+def decode_records(data):
+    records = []
+    offset = FIRST_RECORD_OFFSET
+    while offset + RECORD_SIZE <= len(data):
+        rec = data[offset:offset + RECORD_SIZE]
+        ts = int.from_bytes(rec[0:4], 'little')
+        if ts < 100000000 or ts > 2000000000:
+            offset += RECORD_SIZE
+            continue
+        dt = ZK_EPOCH + timedelta(seconds=ts)
+        user_id = int.from_bytes(rec[16:20], 'little')
+        verify_type = rec[24]
+        status = rec[25]
+        records.append({
+            'time': dt,
+            'user_id': user_id,
+            'status': status,
+            'verify_type': verify_type,
+        })
+        offset += RECORD_SIZE
+    return records
 
-    rows_written = 0
-    rows_skipped = 0
 
-    with open(input_path, "r", encoding="utf-8", errors="replace") as fin, \
-         open(output_path, "w", newline="", encoding="utf-8") as fout:
-
+def write_csv(records, output_path):
+    with open(output_path, 'w', newline='', encoding='utf-8') as fout:
         writer = csv.writer(fout)
-        # Header row matching ERPNext Employee Checkin import template
         writer.writerow([
-            "attendance_device_id",  # Helper column - lookup against Employee.attendance_device_id
-            "employee",              # Fill in after lookup (Employee ID like HR-EMP-00001)
-            "time",                  # Timestamp
-            "log_type",              # IN or OUT
-            "device_id",             # Device identifier
+            "attendance_device_id",
+            "employee",
+            "time",
+            "log_type",
+            "device_id",
         ])
-
-        for line_num, line in enumerate(fin, 1):
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.split("\t")
-            if len(parts) < 3:
-                # Try space-separated as fallback
-                parts = line.split()
-                if len(parts) < 3:
-                    print(f"  Line {line_num}: skipping malformed: {line!r}")
-                    rows_skipped += 1
-                    continue
-
-            user_id = parts[0].strip()
-            timestamp = parts[1].strip() if len(parts) > 1 else ""
-            # Some exports combine date and time as parts[1] and parts[2]
-            if len(parts) > 2 and parts[2].strip() and ":" in parts[2]:
-                timestamp = f"{parts[1].strip()} {parts[2].strip()}"
-                status = parts[3].strip() if len(parts) > 3 else "0"
-            else:
-                status = parts[2].strip() if len(parts) > 2 else "0"
-
-            log_type = LOG_TYPE_MAP.get(status, "IN")
-
+        for r in records:
             writer.writerow([
-                user_id,
-                "",  # employee - fill in manually or via VLOOKUP in Excel
-                timestamp,
-                log_type,
+                r['user_id'],
+                "",
+                r['time'].strftime("%Y-%m-%d %H:%M:%S"),
+                LOG_TYPE_MAP.get(r['status'], "IN"),
                 DEVICE_LABEL,
             ])
-            rows_written += 1
 
-    print(f"\nDone. Wrote {rows_written} records to {output_path}")
-    if rows_skipped:
-        print(f"Skipped {rows_skipped} malformed lines")
+
+def main():
+    input_file = sys.argv[1] if len(sys.argv) > 1 else "BKtransaction.dat"
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "employee_checkins.csv"
+
+    if not os.path.exists(input_file):
+        print(f"ERROR: Input file not found: {input_file}")
+        print("Usage: python convert_attlog.py <input.dat> <output.csv>")
+        sys.exit(1)
+
+    with open(input_file, 'rb') as f:
+        data = f.read()
+
+    print(f"Read {len(data)} bytes from {input_file}")
+
+    try:
+        if len(data) > 40:
+            serial = data[1:14].decode('ascii', errors='replace').strip()
+            firmware = data[15:37].decode('ascii', errors='replace').strip()
+            print(f"  Device serial:    {serial}")
+            print(f"  Firmware version: {firmware}")
+    except Exception:
+        pass
+
+    records = decode_records(data)
+    print(f"\nDecoded {len(records)} attendance records")
+
+    if not records:
+        print("No records found. Check that this is the correct file.")
+        sys.exit(1)
+
+    users = set(r['user_id'] for r in records)
+    print(f"  Unique users:  {len(users)}")
+    print(f"  Date range:    {records[0]['time']} to {records[-1]['time']}")
+
+    now = datetime.now()
+    future_records = sum(1 for r in records if r['time'] > now)
+    if future_records:
+        print(f"\n!!! WARNING: {future_records} records have FUTURE dates !!!")
+        print("    Your device clock is set incorrectly.")
+        print("    Fix at: Menu -> System -> Date/Time before next export.")
+
+    verify_counts = Counter(r['verify_type'] for r in records)
+    print(f"\n  Verification methods:")
+    for v, count in verify_counts.most_common():
+        name = VERIFY_NAMES.get(v, f"Unknown ({v})")
+        print(f"    {name}: {count}")
+
+    write_csv(records, output_file)
+    print(f"\nWrote CSV to {output_file}")
+
     print("\nNext steps:")
-    print("1. Open the CSV in Excel")
-    print("2. Fill the 'employee' column with Employee IDs from ERPNext")
-    print("   (use VLOOKUP against your Employee list export)")
-    print("3. In ERPNext: Data Import -> New -> Document Type: Employee Checkin")
-    print("4. Upload the CSV, click Save, then Start Import")
-    return True
+    print("  1. Open the CSV in Excel to inspect")
+    print("  2. Fill in the 'employee' column with ERPNext Employee IDs")
+    print("     (VLOOKUP attendance_device_id against your Employee list)")
+    print("  3. ERPNext: Data Import -> New -> Document Type: Employee Checkin")
+    print("  4. Upload, Save, then Start Import")
 
 
 if __name__ == "__main__":
-    input_file = sys.argv[1] if len(sys.argv) > 1 else "attlog.dat"
-    output_file = sys.argv[2] if len(sys.argv) > 2 else "employee_checkins.csv"
-    convert(input_file, output_file)
+    main()
